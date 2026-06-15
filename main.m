@@ -53,8 +53,6 @@ static NSString *const kShaderSource =
     @"    out.color = vertices[vid].color;\n"
     @"    return out;\n"
     @"}\n"
-
-    @"}\n"
     @"fragment float4 fragmentShader(VertexOut in [[stage_in]]) {\n"
     @"    return in.color;\n"
     @"}\n";
