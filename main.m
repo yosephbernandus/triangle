@@ -45,12 +45,15 @@ static NSString *const kShaderSource =
     @"struct VertexIn  { float2 position; float4 color; };\n"
     @"struct VertexOut { float4 position [[position]]; float4 color; };\n"
     @"vertex VertexOut vertexShader(uint vid [[vertex_id]],\n"
-    @"                              constant VertexIn *vertices [[buffer(0)]]) "
-    @"{\n"
+    @"                              constant VertexIn *vertices "
+    @"[[buffer(0)]],\n"
+    @"                              constant float4x4 &mvp [[buffer(1)]]) {\n"
     @"    VertexOut out;\n"
-    @"    out.position = float4(vertices[vid].position, 0.0, 1.0);\n"
+    @"    out.position = mvp * float4(vertices[vid].position, 0.0, 1.0);\n"
     @"    out.color = vertices[vid].color;\n"
     @"    return out;\n"
+    @"}\n"
+
     @"}\n"
     @"fragment float4 fragmentShader(VertexOut in [[stage_in]]) {\n"
     @"    return in.color;\n"
@@ -61,6 +64,7 @@ static NSString *const kShaderSource =
 @property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property(nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property(nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
+@property(nonatomic) float rotation;
 - (instancetype)initWithDevice:(id<MTLDevice>)device;
 @end
 
@@ -108,6 +112,20 @@ static NSString *const kShaderSource =
 }
 
 - (void)drawInMTKView:(MTKView *)view {
+  self.rotation += 0.01f; // radians added per frame → the spin
+
+  CGSize size = view.drawableSize;
+  if (size.height == 0) {
+    return;
+  }
+  float aspect = (float)(size.width / size.height);
+
+  matrix_float4x4 model = mat_rotationY(self.rotation);
+  matrix_float4x4 viewM = mat_translation(0, 0, -2.0f);
+  matrix_float4x4 proj =
+      mat_perspective(60.0f * (float)M_PI / 180.0f, aspect, 0.1f, 100.0f);
+  matrix_float4x4 mvp = simd_mul(proj, simd_mul(viewM, model));
+
   id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
   MTLRenderPassDescriptor *passDescriptor = view.currentRenderPassDescriptor;
   if (passDescriptor == nil) {
@@ -119,6 +137,9 @@ static NSString *const kShaderSource =
 
   [encoder setRenderPipelineState:self.pipelineState];
   [encoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
+  [encoder setVertexBytes:&mvp
+                   length:sizeof(mvp)
+                  atIndex:1]; // the matrix → buffer(1)
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
   [encoder endEncoding];
