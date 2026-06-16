@@ -1,19 +1,31 @@
 #import <Cocoa/Cocoa.h>
 #import <MetalKit/MetalKit.h>
+#import <math.h>
 #import <simd/simd.h>
 
 typedef struct {
-  vector_float2 position;
+  vector_float3 position; // now 3D: (x, y, z)
   vector_float4 color;
 } Vertex;
 
+// --- Matrix helpers (each { } is a COLUMN — Metal is column-major) ---
 static matrix_float4x4 mat_rotationY(float a) {
   float c = cosf(a), s = sinf(a);
   return (matrix_float4x4){{
-      {c, 0, -s, 0}, // column 0
-      {0, 1, 0, 0},  // column 1
-      {s, 0, c, 0},  // column 2
-      {0, 0, 0, 1},  // column 3
+      {c, 0, -s, 0},
+      {0, 1, 0, 0},
+      {s, 0, c, 0},
+      {0, 0, 0, 1},
+  }};
+}
+
+static matrix_float4x4 mat_rotationX(float a) {
+  float c = cosf(a), s = sinf(a);
+  return (matrix_float4x4){{
+      {1, 0, 0, 0},
+      {0, c, s, 0},
+      {0, -s, c, 0},
+      {0, 0, 0, 1},
   }};
 }
 
@@ -42,14 +54,14 @@ static matrix_float4x4 mat_perspective(float fovy, float aspect, float nearZ,
 static NSString *const kShaderSource =
     @"#include <metal_stdlib>\n"
     @"using namespace metal;\n"
-    @"struct VertexIn  { float2 position; float4 color; };\n"
+    @"struct VertexIn  { float3 position; float4 color; };\n"
     @"struct VertexOut { float4 position [[position]]; float4 color; };\n"
     @"vertex VertexOut vertexShader(uint vid [[vertex_id]],\n"
     @"                              constant VertexIn *vertices "
     @"[[buffer(0)]],\n"
     @"                              constant float4x4 &mvp [[buffer(1)]]) {\n"
     @"    VertexOut out;\n"
-    @"    out.position = mvp * float4(vertices[vid].position, 0.0, 1.0);\n"
+    @"    out.position = mvp * float4(vertices[vid].position, 1.0);\n"
     @"    out.color = vertices[vid].color;\n"
     @"    return out;\n"
     @"}\n"
@@ -62,6 +74,7 @@ static NSString *const kShaderSource =
 @property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property(nonatomic, strong) id<MTLBuffer> vertexBuffer;
 @property(nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthState;
 @property(nonatomic) float rotation;
 - (instancetype)initWithDevice:(id<MTLDevice>)device;
 @end
@@ -73,13 +86,28 @@ static NSString *const kShaderSource =
     _device = device;
     _commandQueue = [device newCommandQueue];
 
-    static const Vertex triangleVertices[] = {
-        {{0.0, 0.5}, {1.0, 0.0, 0.0, 1.0}},
-        {{-0.5, -0.5}, {0.0, 1.0, 0.0, 1.0}},
-        {{0.5, -0.5}, {0.0, 0.0, 1.0, 1.0}},
+    // 4 corners, 4 colors. Each face blends the 3 corner colors it touches.
+    // A=red  B=green  C=blue  D=yellow
+    static const Vertex tetra[] = {
+        // face A,B,C
+        {{0.4, 0.4, 0.4}, {1, 0, 0, 1}},
+        {{0.4, -0.4, -0.4}, {0, 1, 0, 1}},
+        {{-0.4, 0.4, -0.4}, {0, 0, 1, 1}},
+        // face A,C,D
+        {{0.4, 0.4, 0.4}, {1, 0, 0, 1}},
+        {{-0.4, 0.4, -0.4}, {0, 0, 1, 1}},
+        {{-0.4, -0.4, 0.4}, {1, 1, 0, 1}},
+        // face A,D,B
+        {{0.4, 0.4, 0.4}, {1, 0, 0, 1}},
+        {{-0.4, -0.4, 0.4}, {1, 1, 0, 1}},
+        {{0.4, -0.4, -0.4}, {0, 1, 0, 1}},
+        // face B,D,C
+        {{0.4, -0.4, -0.4}, {0, 1, 0, 1}},
+        {{-0.4, -0.4, 0.4}, {1, 1, 0, 1}},
+        {{-0.4, 0.4, -0.4}, {0, 0, 1, 1}},
     };
-    _vertexBuffer = [device newBufferWithBytes:triangleVertices
-                                        length:sizeof(triangleVertices)
+    _vertexBuffer = [device newBufferWithBytes:tetra
+                                        length:sizeof(tetra)
                                        options:MTLResourceStorageModeShared];
 
     NSError *error = nil;
@@ -100,17 +128,29 @@ static NSString *const kShaderSource =
     desc.vertexFunction = vertexFn;
     desc.fragmentFunction = fragmentFn;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float; // depth on
     _pipelineState = [device newRenderPipelineStateWithDescriptor:desc
                                                             error:&error];
     if (_pipelineState == nil) {
       NSLog(@"Pipeline failed: %@", error);
     }
+
+    // Depth test: keep the fragment nearest the camera, discard the ones
+    // behind.
+    MTLDepthStencilDescriptor *dsd = [[MTLDepthStencilDescriptor alloc] init];
+    dsd.depthCompareFunction = MTLCompareFunctionLess;
+    dsd.depthWriteEnabled = YES;
+    _depthState = [device newDepthStencilStateWithDescriptor:dsd];
   }
   return self;
 }
 
 - (void)drawInMTKView:(MTKView *)view {
-  self.rotation += 0.01f; // radians added per frame → the spin
+  if (self.pipelineState == nil) {
+    return;
+  } // fail gracefully on shader error
+
+  self.rotation += 0.01f;
 
   CGSize size = view.drawableSize;
   if (size.height == 0) {
@@ -118,8 +158,9 @@ static NSString *const kShaderSource =
   }
   float aspect = (float)(size.width / size.height);
 
-  matrix_float4x4 model = mat_rotationY(self.rotation);
-  matrix_float4x4 viewM = mat_translation(0, 0, -2.0f);
+  matrix_float4x4 model =
+      simd_mul(mat_rotationY(self.rotation), mat_rotationX(0.5f));
+  matrix_float4x4 viewM = mat_translation(0, 0, -2.5f);
   matrix_float4x4 proj =
       mat_perspective(60.0f * (float)M_PI / 180.0f, aspect, 0.1f, 100.0f);
   matrix_float4x4 mvp = simd_mul(proj, simd_mul(viewM, model));
@@ -134,11 +175,12 @@ static NSString *const kShaderSource =
       [commandBuffer renderCommandEncoderWithDescriptor:passDescriptor];
 
   [encoder setRenderPipelineState:self.pipelineState];
+  [encoder setDepthStencilState:self.depthState];
   [encoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
-  [encoder setVertexBytes:&mvp
-                   length:sizeof(mvp)
-                  atIndex:1]; // the matrix → buffer(1)
-  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  [encoder setVertexBytes:&mvp length:sizeof(mvp) atIndex:1];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+              vertexStart:0
+              vertexCount:12];
 
   [encoder endEncoding];
   [commandBuffer presentDrawable:view.currentDrawable];
@@ -172,6 +214,8 @@ int main() {
 
     MTKView *mtkView = [[MTKView alloc] initWithFrame:frame device:device];
     mtkView.clearColor = MTLClearColorMake(0.1, 0.1, 0.15, 1.0);
+    mtkView.depthStencilPixelFormat =
+        MTLPixelFormatDepth32Float; // give the view a depth buffer
 
     Renderer *renderer = [[Renderer alloc] initWithDevice:device];
     mtkView.delegate = renderer;
